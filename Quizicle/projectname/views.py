@@ -3,16 +3,16 @@ from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.shortcuts import render, redirect, get_object_or_404
 from django.urls import reverse_lazy
-from django.views.generic import CreateView, ListView, DetailView, FormView
+from django.views.generic import CreateView, ListView, DetailView
 from django.utils.decorators import method_decorator
 from django.db.models import Max
 from .models import Quiz, Question, Answer, Results
-from .forms import QuizForm, QuestionForm
+from .forms import QuizForm
 from django.http import JsonResponse
-from django.core.files.storage import default_storage
-from django.contrib.auth.mixins import LoginRequiredMixin
-from .forms import CustomLoginForm
-from django.contrib.auth import authenticate, login
+from django.db import models
+from django.contrib.auth.mixins import LoginRequiredMixin, UserPassesTestMixin
+from django.views.generic import DeleteView
+
 
 # Registration view
 def register(request):
@@ -49,52 +49,50 @@ class QuizCreateView(CreateView):
         quiz.creator = self.request.user
         quiz.save()
 
-        # Get question data from POST
-        questions = self.request.POST.getlist('questions[]')
-        points = self.request.POST.getlist('points[]')
-        question_images = self.request.FILES.getlist('question_images[]')  # Get uploaded images
+        self._save_questions_and_answers(quiz)
 
-        # Get correct answers dynamically
-        correct_answers = {
-            key.split("_")[2]: value  # Extracts the question index
-            for key, value in self.request.POST.items() if key.startswith("correct_answer_")
-        }
-
-        for q_index, question_text in enumerate(questions):
-            if question_text.strip():
-                # Save the question image if it exists
-                additional_image = question_images[q_index] if q_index < len(question_images) else None
-
-                question = Question.objects.create(
-                    quiz=quiz,
-                    description=question_text.strip(),
-                    points_for_question=int(points[q_index]),
-                    image=additional_image,  # Save the image
-                )
-
-                # Get answers for this specific question
-                answers_for_question = self.request.POST.getlist(f'all_answers[{q_index}][]')
-
-                # Retrieve correct answer index safely
-                correct_answer_index = correct_answers.get(str(q_index))
-                correct_answer_index = int(correct_answer_index) if correct_answer_index is not None else None
-
-                for a_index, answer_text in enumerate(answers_for_question):
-                    if answer_text.strip():
-                        is_correct = (a_index == correct_answer_index)  # Match correct answer index
-
-                        Answer.objects.create(
-                            Question=question,
-                            Answer=answer_text.strip(),
-                            Correct=is_correct
-                        )
-
-        # Update quiz metadata
-        quiz.QuestionCount = len(questions)
-        quiz.QuizMaximumPoints = sum(map(int, points))
+        # Update metadata
+        quiz.QuestionCount = quiz.questions.count()
+        quiz.QuizMaximumPoints = quiz.questions.aggregate(total=models.Sum('points_for_question'))['total'] or 0
         quiz.save()
 
         return redirect(self.success_url)
+
+    def _save_questions_and_answers(self, quiz):
+        request = self.request
+        questions = request.POST.getlist('questions[]')
+        points = request.POST.getlist('points[]')
+        question_images = request.FILES.getlist('question_images[]')
+
+        correct_answers = {
+            key.split("_")[2]: value
+            for key, value in request.POST.items() if key.startswith("correct_answer_")
+        }
+
+        for index, question_text in enumerate(questions):
+            if not question_text.strip():
+                continue
+
+            question = Question.objects.create(
+                quiz=quiz,
+                description=question_text.strip(),
+                points_for_question=int(points[index]),
+                image=question_images[index] if index < len(question_images) else None
+            )
+
+            answers = request.POST.getlist(f'all_answers[{index}][]')
+            correct_index = int(correct_answers.get(str(index), -1))
+
+            self._create_answers(question, answers, correct_index)
+
+    def _create_answers(self, question, answers, correct_index):
+        for i, answer in enumerate(answers):
+            if answer.strip():
+                Answer.objects.create(
+                    question=question,
+                    answer=answer.strip(),
+                    correct=(i == correct_index)
+                )
 # View to add questions and answers dynamically inside the Quiz creation page
 
 
@@ -106,14 +104,8 @@ class QuizListView(LoginRequiredMixin, ListView):
 
     def get_queryset(self):
         query = self.request.GET.get('q', '')
-        user = self.request.user
-
-        queryset = Quiz.objects.filter(creator=user)
-        
-        if query:
-            queryset = queryset.filter(QuizName__icontains=query)
-        
-        return queryset
+        base_queryset = Quiz.objects.filter(creator=self.request.user)
+        return base_queryset.filter(quiz_name__icontains=query) if query else base_queryset
 
 # Take a quiz and submit answers
 @method_decorator(login_required, name='dispatch')
@@ -140,7 +132,7 @@ class TakeQuizView(DetailView):
             selected_answer_id = request.POST.get(f'question_{question.id}')
             if selected_answer_id:
                 selected_answer = Answer.objects.get(id=selected_answer_id)
-                if selected_answer.Correct:
+                if selected_answer.correct:
                     score += question.points_for_question
 
         return redirect('quiz_result', quiz_id=quiz.id, score=score)
@@ -164,10 +156,10 @@ class QuizResultView(DetailView):
         score = self.kwargs['score']
 
         # Fetch the previous best result for the user
-        previous_result = Results.objects.filter(Quiz=quiz, User=self.request.user.username).aggregate(Max('Result'))['Result__max']
+        previous_result = Results.objects.filter(quiz=quiz, user=self.request.user.username).aggregate(Max('result'))['result__max']
 
         if previous_result is None or score > previous_result:
-            Results.objects.create(Quiz=quiz, User=self.request.user.username, Result=score)
+            Results.objects.create(quiz=quiz, user=self.request.user.username, result=score)
             message = f"🎉 New High Score! You scored {score}."
         elif score == previous_result:
             message = f"🏆 You matched your previous best score: {score}."
@@ -187,23 +179,13 @@ def search_quizzes(request):
     }
     return JsonResponse(data)
 
-def custom_login_view(request):
-    if request.method == 'POST':
-        form = CustomLoginForm(request.POST)
-        
-        if form.is_valid():
-            username = form.cleaned_data['username']
-            password = form.cleaned_data['password']
-            
-            user = authenticate(request, username=username, password=password)
-            
-            if user is not None:
-                login(request, user)
-                messages.success(request, f'Welcome back, {user.username}!')
-                return redirect('quiz_list')  # Redirect to your quiz list or dashboard
-            else:
-                messages.error(request, 'Invalid username or password')
-    else:
-        form = CustomLoginForm()
 
-    return render(request, 'login.html', {'form': form})
+class QuizDeleteView(LoginRequiredMixin, UserPassesTestMixin, DeleteView):
+    model = Quiz
+    template_name = 'quiz_confirm_delete.html'
+    success_url = reverse_lazy('quiz_list')
+
+    def test_func(self):
+        quiz = self.get_object()
+        return quiz.creator == self.request.user  # Only allow quiz owner to delete
+
